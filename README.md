@@ -3,6 +3,7 @@ This repository contains programs to extract homologous exons based on
 sequence alignments and the exon-intron structure information.
 
 Two types of sequence alignments can be used for this purpose:
+
 1. alignments of protein-coding sequences of homologous genes.
 2. alignments of whole-genome sequences.
 
