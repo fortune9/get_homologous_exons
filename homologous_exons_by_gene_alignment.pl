@@ -2,46 +2,52 @@
 
 use warnings;
 use strict;
-use MyPackage::Functions qw/test_if_file_exist/;
+#use MyPackage::Functions qw/test_if_file_exist/;
 use Bio::AlignIO;
 use Bio::SimpleAlign;
 use Getopt::Long;
 use File::Temp qw/tempdir tempfile/;
 
-my $minimalBlockNum = 3; # the minimal number of blocks in a sequence to analyze
+my $IP = '[INFO]'; # info prefix
+my $WP = '[WARN]'; # warning prefix
+my $EP = '[ERROR]'; # error prefix
+my $minimalBlockNum = 1; # the minimal number of blocks in a sequence to analyze
 my $alnFile;
-my $structureFile;
+my @structureFiles;
 my $outFile;
 my $format;
 my $minusStop;
 my $ignoreAln;
 my $cdsStartCol;
+my $noEnds;
 
 GetOptions(
 		"aln-file=s"       => \$alnFile,
-		"structure-file=s" => \$structureFile,
-		"cds-start-column:i" => \$cdsStartCol, 
-		"out-file:s"       => \$outFile,
 		"format:s"         => \$format,
+		"structure-file=s@" => \@structureFiles,
+		"ignore!"          => \$ignoreAln,
+		"out-file:s"       => \$outFile,
 		"minus-stop!"      => \$minusStop,
-		"ignore!"          => \$ignoreAln
+		"no-ends!" => \$noEnds,
+		"cds-offset-col:i" => \$cdsStartCol
 );
 
-&usage() unless($alnFile and $structureFile);
+&usage() unless($alnFile and @structureFiles);
 
-test_if_file_exist($outFile) if($outFile);
+#test_if_file_exist($outFile) if($outFile);
 
 $outFile ||= '-';
 $format  ||= 'clustalw';
-$ignoreAln = 0 unless(defined $ignoreAln);
-$minusStop = 1 unless(defined $minusStop);
+#$ignoreAln = 0 unless(defined $ignoreAln);
+#$minusStop = 1 unless(defined $minusStop);
 my $stopLen = 3; # the length to be substracted from the sum of block lengths
 
 # parse the structure file
-my $structureParser = _parse_structure_file($structureFile);
+my $structureParser = _parse_structure_file(@structureFiles);
 
 # create a temporary directory for usage when necessary
-my $tmpDir = tempdir("homologous_exons.$$.XXXXXXXXX", DIR => '/tmp', CLEANUP => 1);
+#my $tmpDir = tempdir("homologous_exons.$$.XXXXXXXXX", DIR => '/tmp', CLEANUP => 1);
+my $tmpDir = tempdir("homologous_exons.$$.XXXXXXXXX", CLEANUP => 1);
 # got the alignment file names
 my @alnFiles;
 if(-d $alnFile) # a directory
@@ -63,7 +69,7 @@ if(-d $alnFile) # a directory
 	}
 }
 
-warn scalar(@alnFiles)." alignment files are found\n";
+warn "$IP ".scalar(@alnFiles)." alignment files are found\n";
 
 my $counter = 0;
 my $alignmentCounter = 0; # record the total alignment analyzed
@@ -72,9 +78,10 @@ my $pairId = 0; # the unique id for each homologous exon pair
 
 open(OUT,"> $outFile") or die "can not open $outFile:$!";
 print OUT "#produced by $0\n";
-print OUT join("\t",qw/pair_id seq_5 exon_5 seq_3 exon_3 align_type identity aligned_length length_diff frames
-                    aligned_bound bound_5 bound_3 exon_dist file aln_counter/),"\n";
-
+print OUT join("\t",qw/pair_id seq_5 exon_5 seq_3 exon_3 align_type 
+	identity aligned_length aligned_length_frac length_diff frames
+    aligned_bound bound_5 bound_3 exon_dist file aln_counter/),"\n";
+warn "$IP finding homologous exons ...\n";
 foreach my $file (@alnFiles)
 {
 	my $alnIn = Bio::AlignIO->new(-file => $file, -format => $format);
@@ -91,36 +98,38 @@ foreach my $file (@alnFiles)
 		# get the homologous exon pairs with aligned criterion
 		my ($homoExonPairArrayRef) = &find_homologous_exon_pairs($aln);
 
-		next unless($homoExonPairArrayRef); # no homolog exons found in this alignment
+		unless($homoExonPairArrayRef)
+		{
+			warn "$WP no homolog exons found in $file [$alnCounter]\n";
+			next;
+		}
 		
 		# output the result
 		foreach my $pairNode (@$homoExonPairArrayRef)
 		{
 			print OUT join("\t",@$pairNode,$baseFile,$alnCounter),"\n";
 		}
-		$successAlnCounter++;
 
+		warn "$IP $successAlnCounter alignments have been processed\n" 
+		if(++$successAlnCounter % 100 == 0);
 	} # end of the alignment file
 	
 	$alignmentCounter += $alnCounter;
-
-	warn "$counter files has been parsed\n" if(++$counter%100 == 0);
+	$counter++;
 }
 
 
 close OUT;
 
 # remove temporary directory
-warn "Removing the temporaty directory ...\n";
+warn "$IP Removing the temporaty directory ...\n";
 unlink <$tmpDir/*>;
-rmdir($tmpDir) or warn "can not remove $tmpDir\n";
+rmdir($tmpDir) or warn "$WP can not remove $tmpDir\n";
 
 warn '*' x 60, "\nThe whole work is successfully finished\n";
-warn '=' x 60, "\nTotally $counter files($alignmentCounter alignments [$successAlnCounter successes]) are analyzed\n";
-
+warn '=' x 60, "\nTotally $counter files($alignmentCounter alignments [$successAlnCounter successes]) are processed\n";
 
 exit 0;
-
 
 sub find_homologous_exon_pairs
 {
@@ -130,59 +139,60 @@ sub find_homologous_exon_pairs
 	my ($alignedPosRef,$exonHash) = &aligned_positions($aln);
 	return undef unless($alignedPosRef);
 
-	# got the homologous exon pairs
-	my $alignedPos5ss = $alignedPosRef->{'5ss'};
-	my $alignedPos3ss = $alignedPosRef->{'3ss'};
+	# got the exons aligned at one end
+	my $alignedExons5 = $alignedPosRef->{'5'}; # exons aligned at 5' end
+	my $alignedExons3 = $alignedPosRef->{'3'}; # exons aligned at 3' end
 
-	# merge the two results and get the final result
+	# merge the two results to get final result, particularly for
+	# exons aligned at both ends
 	my %homoExonPairs;
-	while( my ($alnPos,$exonsRef) = each %$alignedPos5ss )
+	while( my ($alnPos,$exonsRef) = each %$alignedExons5 )
 	{
 		next unless($#$exonsRef > 0);# more than one exons exist
-		for(my $i = 0; $i <= $#$exonsRef; $i++)
+		for(my $i = 0; $i < $#$exonsRef; $i++)
 		{
 			my $qExon = $exonsRef->[$i];
 			for(my $j = $i+1; $j <= $#$exonsRef; $j++)
 			{
 				my $tExon = $exonsRef->[$j];
-				$homoExonPairs{$qExon}->{$tExon} = '5ss';
+				$homoExonPairs{$qExon}->{$tExon} = '5';
 			}
 		}# end of a given position
-	}# end of 5'ss mapping
+	}# end of 5' end alignment
 	
-	# update this by 3ss positions
-	while( my ($alnPos,$exonsRef) = each %$alignedPos3ss )
+	# update this by 3' end positions
+	while( my ($alnPos,$exonsRef) = each %$alignedExons3 )
 	{
 		next unless($#$exonsRef > 0);# need more than one exons for following analysis
-		for(my $i = 0; $i <= $#$exonsRef; $i++)
+		for(my $i = 0; $i < $#$exonsRef; $i++)
 		{
 			my $qExon = $exonsRef->[$i];
 			for(my $j = $i+1; $j <= $#$exonsRef; $j++)
 			{
 				my $tExon = $exonsRef->[$j];
-				if(exists $homoExonPairs{$qExon}->{$tExon}) # the 5'ss exon boundary also align
+				if(exists $homoExonPairs{$qExon}->{$tExon}) # the 5' end also align
 				{
 					$homoExonPairs{$qExon}->{$tExon} = 'both';
-				}elsif(exists $homoExonPairs{$tExon}->{$qExon}) # the same, by another name
+				}elsif(exists $homoExonPairs{$tExon}->{$qExon}) # the same, by another name order
 				{
 					$homoExonPairs{$tExon}->{$qExon} = 'both';
-				}else
+				}else # only aligned at 3' end
 				{
-					$homoExonPairs{$qExon}->{$tExon} = '3ss';
+					$homoExonPairs{$qExon}->{$tExon} = '3';
 				}
 			}
 		}# end of a given position
-	}# end of the 3'ss mapping
+	}# end of the 3' end alignment
 
 	my @homoExonPairInfo;
 	# get the final outputed result
 	while( my ($qExon,$tExonRef) = each %homoExonPairs )
 	{
-		my ($qName,$qOrder,$qFrame,$qLength,$qAln5ssPos,$qAln3ssPos) =
+		my ($qName,$qOrder,$qFrame,$qLength,$qAlnPos5,$qAlnPos3) =
 		@{$exonHash->{'by_id'}->[$qExon]};
 		while( my ($tExon,$alignType) = each %$tExonRef )
 		{
-			my ($tName,$tOrder,$tFrame,$tLength,$tAln5ssPos,$tAln3ssPos) =
+			my ($tName,$tOrder,$tFrame,$tLength,$tAlnPos5,$tAlnPos3) =
 			@{$exonHash->{'by_id'}->[$tExon]};
 			# create a new alignment containing only these two sequences
 			my $newAln = _get_sub_aln($aln,$qName,$tName);
@@ -190,20 +200,23 @@ sub find_homologous_exon_pairs
 			my $frameString;
 			my $identity;
 			my $alignedLen;
-			my $alignedPos;
-			my $aligned5Pos; # the other unaligned pos near 5'
-			my $aligned3Pos; # the other unaligned pos near 3'
-			my $distance; # the distance for the boundaries at the unaligned side, gap-only columns
-			my $firstExon; # the exon with the other boundary close to the aligned boundary
-			my $secondExon; # the exon with the other boundary distant to the aligned boundary
-			# are excluded before calculation
+			my $alignedPos; # alignment position where exons are aligned
+			my $aligned5Pos; # the position of the other unaligned end near 5'
+			my $aligned3Pos; # the position of the other unaligned end near 3'
+			my $distance; # the distance for the boundaries at the unaligned ends, 
+			# gap-only columns are excluded before calculation
+			my $firstExon; # the exon in homologous pair that is
+			               # closer 5' end
+			my $secondExon; # the exon in homologous pair that is
+			                # farther to 5' end
 			if($alignType =~ /both/i)
 			{
 				$frameString = "$qFrame,$tFrame";
-				warn "Th----------------------------------\n" if($qAln3ssPos != $tAln3ssPos);
-				$alignedPos  = $qAln3ssPos; # using the left aligned boundary
-				$aligned5Pos = $qAln5ssPos; # this two should be equal
-				$aligned3Pos = $tAln5ssPos;
+				warn "$EP The 3' ends between $qName:$qOrder and"
+				." $tName:$tOrder don't align\n" if($qAlnPos3 != $tAlnPos3);
+				$alignedPos  = $qAlnPos5; # using the left aligned boundary
+				$aligned5Pos = $qAlnPos3; # this and next should be equal
+				$aligned3Pos = $tAlnPos3;
 				$firstExon  = "$qName\t$qOrder"; # the proximal exon first
 				$secondExon = "$tName\t$tOrder";
 				my $subAln;
@@ -218,20 +231,20 @@ sub find_homologous_exon_pairs
 				$identity = $subAln->average_percentage_identity;
 				$distance = 0;
 				$alignedLen = $subAln->remove_gaps->length;
-			}elsif($alignType =~ /3ss/i)
+			}elsif($alignType =~ /5/i) # aligned at 5' ends
 			{
-				$alignedPos  = $qAln3ssPos;
-				if($qAln5ssPos <= $tAln5ssPos)
+				$alignedPos  = $qAlnPos5;
+				if($qAlnPos3 <= $tAlnPos3) # q is before t
 				{
-					$aligned5Pos = $qAln5ssPos;
-					$aligned3Pos  = $tAln5ssPos;
+					$aligned5Pos = $qAlnPos3;
+					$aligned3Pos = $tAlnPos3;
 					$firstExon  = "$qName\t$qOrder";
 					$secondExon = "$tName\t$tOrder";
 					$frameString = "$qFrame,$tFrame";
-				}else
+				}else # q is after t
 				{
-					$aligned5Pos = $tAln5ssPos;
-					$aligned3Pos = $qAln5ssPos;
+					$aligned5Pos = $tAlnPos3;
+					$aligned3Pos = $qAlnPos3;
 					$firstExon  = "$tName\t$tOrder";
 					$secondExon = "$qName\t$qOrder";
 					$frameString = "$tFrame,$qFrame";
@@ -249,20 +262,20 @@ sub find_homologous_exon_pairs
 				my $distanceAln = $newAln->slice($aligned5Pos,$aligned3Pos);
 				$distance = $distanceAln->length - 1;
 				$alignedLen = $subAln->remove_gaps->length;
-			}elsif($alignType =~ /5ss/i)
+			}elsif($alignType =~ /3/i) # aligned on the 3'ends
 			{
-				$alignedPos = $qAln5ssPos;
-				if($qAln3ssPos <= $tAln3ssPos) # equal is actually impossible
+				$alignedPos = $qAlnPos3;
+				if($qAlnPos5 <= $tAlnPos5) # q is before t
 				{
-					$aligned5Pos = $qAln3ssPos;
-					$aligned3Pos = $tAln3ssPos;
+					$aligned5Pos = $qAlnPos5;
+					$aligned3Pos = $tAlnPos5;
 					$firstExon  = "$qName\t$qOrder";
 					$secondExon = "$tName\t$tOrder";
 					$frameString = "$qFrame,$tFrame";
-				}else
+				}else # t is before q
 				{
-					$aligned5Pos = $tAln3ssPos;
-					$aligned3Pos = $qAln3ssPos;
+					$aligned5Pos = $tAlnPos5;
+					$aligned3Pos = $qAlnPos5;
 					$firstExon  = "$tName\t$tOrder";
 					$secondExon = "$qName\t$qOrder";
 					$frameString = "$tFrame,$qFrame";
@@ -282,14 +295,18 @@ sub find_homologous_exon_pairs
 				$alignedLen = $subAln->remove_gaps->length;
 			}else # this should not happen
 			{
-				warn "Unknow homologous exon pair type:$alignType\n";
+				warn "$EP Unknow homologous exon pair type:$alignType".
+				" for $qName:$qOrder vs $tName:$tOrder\n";
 				next;
 			}
 
 			# store the result
+			my $alignedFrac = sprintf("%.5f",
+				$alignedLen/_max($qLength,$tLength));
 			push
 			@homoExonPairInfo,[++$pairId,$firstExon,$secondExon,$alignType,
-			                   $identity,$alignedLen,$lengthDiff,$frameString,$alignedPos,
+			                   sprintf("%.5f", $identity),$alignedLen,
+							   $alignedFrac,$lengthDiff,$frameString,$alignedPos,
 							   $aligned5Pos,$aligned3Pos,$distance];
 
 		}# end of inner while
@@ -318,9 +335,9 @@ sub aligned_positions
 	my $aln = shift;
 	
 	my $exonHash = {};
-	my %alnSplicePos;
+	my %alignedEndPos;
 
-	my $leftSeqNum = $aln->no_sequences;
+	my $leftSeqNum = $aln->num_sequences;
 	my $uniqExonId = 0;
 	my $success = 0; # record the number of sequence successfully analyzed
 	foreach my $seq ($aln->each_seq)
@@ -349,30 +366,37 @@ sub aligned_positions
 		my $seqLen = $seq->end - $seq->start + 1;
 		if($seqLen != $blockLength)
 		{
-			warn("The sum of block lengths($blockLength) in $id is not equal that in alignment ($seqLen)\n");
+			warn("$EP The sum of block lengths($blockLength) in $id is not equal that in alignment ($seqLen)\n");
 			last if($ignoreAln);
 			$leftSeqNum--;
 			next;
 		}
 		
+		# get the aligned positions for each exon
 		my $cumulativeLen = 0;
 		my $blockNum = scalar(@blocks);
-		for(my $i = 0; $i < $blockNum - 1; $i++)
+		for(my $i = 0; $i < $blockNum; $i++)
 		{
 			$cumulativeLen += $blocks[$i];
-			next unless($i > 0); # ignore the first block
+			next if($i == $blockNum-1 and $minusStop and $blocks[$i]
+				<= $stopLen); # ignore last block if it contains
+			# (part) stop codon only
+			# ignore two blocks/exons at two ends if necessary
+			next if($noEnds and ($i == 0 or $i == $blockNum-1 ));
 			# which boundary to check, the 5' or 3'
-			my $ss5Pos = $cumulativeLen;
-			my $ss3Pos = $cumulativeLen - $blocks[$i] + 1;
-			if($ss5Pos > $blockLength) # this occurs when the last exon/block only contain partial stop codon
+			my $end3 = $cumulativeLen; # 3' end
+			my $end5 = $cumulativeLen - $blocks[$i] + 1; # 5'end
+			if($end3 > $blockLength) # this occurs when the last
+			# exon/block only contains part of stop codon, i.e., shorter
+			# than 3 nts
 			{
-				$ss5Pos = $blockLength;
+				$end3 = $blockLength;
 			}
-			my $alnPos5ss;
-			my $alnPos3ss;
+			my $alnPos5; # 5' end of the exon
+			my $alnPos3; # 3' end
 			eval{
-			 $alnPos5ss = $aln->column_from_residue_number($id,$ss5Pos);
-			 $alnPos3ss = $aln->column_from_residue_number($id,$ss3Pos);
+			 $alnPos5 = $aln->column_from_residue_number($id,$end5);
+			 $alnPos3 = $aln->column_from_residue_number($id,$end3);
 			};
 			if($@)
 			{
@@ -386,23 +410,24 @@ sub aligned_positions
 			if($cdsOffSet > $cumulativeLen) # no coding region in this exon
 			{
 				$frame = -1;
-			}elsif($cdsOffSet > $cumulativeLen - $blocks[$i]) # start from this exon
+			}elsif($cdsOffSet > $cumulativeLen - $blocks[$i]) #CDS starts from this exon
 			{
 				$frame = 0;
 			}else # start coding in preceeding exon
 			{
-				$frame = ($cumulativeLen - $blocks[$i] - $cdsOffSet + 1)%3;
+				$frame = ($cumulativeLen - $blocks[$i] - $cdsOffSet +
+					1)%3; # number of codon bases in preceding exon
 			}
 			
 			# seqname, exonid, coding-frame, exon-length, 5ss pos, 3ss pos	
 			$exonHash->{'by_id'}->[$uniqExonId] =
-			[$id,$exonNum,$frame,$blocks[$i],$alnPos5ss,$alnPos3ss];
-			$exonHash->{'by_name'}->{$id}->{$exonNum} = $uniqExonId;
+			[$id,$exonNum,$frame,$blocks[$i],$alnPos5,$alnPos3];
+			# $exonHash->{'by_name'}->{$id}->{$exonNum} = $uniqExonId;
 			
 			# record the aligned exon
-			push @{$alnSplicePos{'5ss'}->{$alnPos5ss}}, $uniqExonId;
-			push @{$alnSplicePos{'3ss'}->{$alnPos3ss}}, $uniqExonId;
-			#$alnSplicePos->{'3ss'}->{$alnPos3ss}->{$id} = $uniqExonId;
+			push @{$alignedEndPos{'5'}->{$alnPos5}}, $uniqExonId;
+			push @{$alignedEndPos{'3'}->{$alnPos3}}, $uniqExonId;
+			#$alignedEndPos->{'3ss'}->{$alnPos3ss}->{$id} = $uniqExonId;
 			
 		} # end for this sequence
 
@@ -410,7 +435,7 @@ sub aligned_positions
 	} # end for this alignment
 
 	return undef unless($success >= 2);
-	return \%alnSplicePos,$exonHash;
+	return \%alignedEndPos,$exonHash;
 }
 
 sub _get_length_diff
@@ -418,7 +443,7 @@ sub _get_length_diff
 	my $len1 = shift;
 	my $len2 = shift;
 
-	return abs($len1 - $len2)/_max($len1,$len2);
+	return sprintf("%.5f", abs($len1 - $len2)/_max($len1,$len2));
 }
 
 sub _max
@@ -442,94 +467,129 @@ sub usage
 
 	Usage: $0 <--option=value> ...
 
-	This script can determine the homologous exons from the multiple sequence alignment. The
-	criteria for a pair of exons to be homologous:
-	1) the exon pairs must be aligned at least in one boundary
+	This program finds the homologous exons based on sequence
+	alignments and exon-intron structure information.
 
-	Meanwhile, these parameters will be calculated to easily filter the results[field]:
-	a) the type of alignment, match at both boundaries(both), or 5'ss(5ss) or 3'ss(3ss)[align_type]
-	b) the identity between the two exons, note the gaps are excluded in calculation
-	c) the length of aligned region for the two exons without gaps[aligned_length]
-	d) the difference of exon lengths, abs(diff)/longgest_exon_length[length_diff]
-	e) the frames for the two exons[frames]
-	f) the alignment position where the exons are aligned, for the 'both' type, the left(5') bound
-	   chosen.[aligned_bound]
-	g) another unaligned position in the alignment near 5' end, in fact this should be aligned
-	   in the 'both' type, and the same as bound_3 field.[bound_5]
-	h) another unaligned position in the alignment near 3' end, in fact this should be aligned   
-	   in the 'both' type, and the same as bound_5 field.[bound_3]
-	i) the distance between the two unaligned boundaries in the alignemnt. Note the gap-only columns
-	   are excluded before counting.[exon_dist]
+	The criteria for determining homologous exons are:
+	1) homologous exon pairs must be aligned on at least one end (5'
+	   or 3' or both)
+
+	The output for each homologous exon pair will include the
+	following parameters (field name is shown in []):
+	a) matching type in the alignment, at both ends (both), just 5' (5) 
+	   or 3' end (3) [align_type]
+	b) the sequence identity between the two exons after excluding
+	   gaps in alignment [identity]
+	c) the length of aligned region for the two exons after excluding gaps 
+	   [aligned_length]
+	d) the length difference fraction between the exon pair, calculated as 
+	   abs(diff)/longer_exon_length [length_diff]
+	e) the translation frames (if any) for the two exons. The frame
+	   denotes the number bases included in precedding exon, so
+	   frame=0, =1, =2 means that the exon starts with a complete
+	   codon, a codon with 2 bases, and a codon with 1 base,
+	   respectively [frames]
+	f) the position in the alignment where the two exons are aligned, for 
+	   the 'both' type, the left (5') end is reported. [aligned_bound]
+	g) the position of the other (un)aligned exon ends in the
+	   alignment which is near 5' end. For 'align_type' is 'both',
+	   this end is aligned and the value in this field will equal that
+	   in the field 'bound_3'. [bound_5]
+	h) similar to the field 'bound_5', but mark one of the two exon
+	   ends distant from 5' end. [bound_3]
+	i) the distance between the two (un)aligned exon ends in alignment. If
+	   'align_type' is 'both', the distance is 0. Note the gap-only columns
+	   are excluded before calculation. [exon_dist]
 
 	Options:
-	--aln-file: the file containing alignment files. This can be a directory, a tared file or a
-	normal file.
+	--aln-file: the file/directory containing sequence alignments.
+	Valid values for this option include a directory, a tared file or
+	a single file containing many alignments. Note the sequence names
+	in alignments must match those in the 'structure-file' (below).
+	
+	--format:  sequence alignment format, default is clustalw.
 
-	--structure-file: the file containing the structure information for each sequence in the
-	alignment. The alignment without structure information will be ignored. The length of the
-	sequence in alignments will be checked if it equals the sum of lengths in structure.
-	A example file:
-	/database/ftp/NCBI/genomes/Human/Build36.2/human_36.2_RefSeq_translated_protein.info.slim
+	--structure-file: the file containing exon-intron structure
+	information for each sequence. Sequences
+	without structure information will be skipped. See below for the
+	requirement on the format of the structure-file. This option can
+	be specified multiple times to input the structure information
+	distributed in multiple files.
 
-	--cds-start-colunmn: which column in the structure above is the CDS start position for each
-	transcript. If not provided, it will assume the first position in each sequence is the CDS
-	start, this is usually the case for the CDS sequence. Original columin is 0.
+	--cds-offset-col: at which column in the structure-file it
+	specifies the cds start in each sequence. If not provided, the
+	first base in each sequence is assumed as the start of CDS. Note
+	the first column should be specified as 0, second as 1, etc. The
+	information is used to calculate translation frames for each exon.
 
-	--ignore: a switch option indicative to ignore the alignment in which if there is at least one
-	sequence with only one exon block or this sequence does not have structure information. If this
-	option is false, then only this sequence is ignored, and the left sequences are analyzed. The
-	default is false.
+	--ignore: a switch option. If provided, sequence alignments
+	containing any sequence that has only one exon or has no structure
+	information will be wholy skipped. In default, only the relevant 
+	sequences will be ignored and the remaining sequences in the
+	alignment will be used.
 	
-	--format:  the multiple sequence alignment format, default is clustalw.
+	--out-file: the file to store the result. In default, it is screen.
 	
-	--out-file: the file to store the result, the default is to print to stdout.
+	--minus-stop: a switch option. If provided, it indicates that the
+	last exon for a sequence should minus 3 bases to trim the stop
+	codon. This is usually the case for CDS alignment, so don't forget
+	this option when necessary.
+
+	--no-ends: a switch option. If provided, the most 5' and 3' exons
+	for each sequence will be ignored.
 	
-	--minus-stop: a switch option indicative whether it is necessary fo substracting stop codon
-	length from the sum of block lengths. This is usually true for the CDS sequence, because they
-	include the stop sequence in it. The alignment in which the length of a sequence does not match
-	the sum of blocks in the structure file will be ignored. The default value is true.
-	
-	Notifications:
-	1) the two marginal exons/blocks will not be considered in analysis.
-	2) in the result, there may be a certain exon matched with another two exons of the same
-	   transcript. There are at least two causes for this, one is that the two exons are merged
-	   (loss of the intron between them), and the other is loss or splicing out of one exon in the
-	   former transcript. One method to distinguish the two is compare the exon lengths among them.
-	   If the former case is true, we should find that the sum of two exons (nearly) equal to the
-	   exon matched. If the latter case is true, then only one of the two exons in the same
-	   transcript equal to the matched exon in another transcript.
+	Format of structure-file:
+	#seq_name  number_of_first_exon  exon_sizes  cds-start
+	seq1         2                   100,200,150    50
+	seq2         1                   300,100,150    1
+	...		...
+
+	The structure-file should contain at least 3 fields separated by
+	<tab>. The fields after the first 3 will be ignored. Optionally,
+	another field specified by the option --cds-offset-col may be
+	used. The first three fields are: sequence name, the exon number
+	of first exon included in the alignment (e.g., 1 if the first exon
+	of the sequence is in the alignment), and the sizes of each
+	exons.
+
+	Notes:
+	1) in the result, one exon of sequence A may match more than one 
+	   exon in another sequence B. This can occur when the two exons
+	   in sequence A lost the intron in-between during evolution.
 	
 	Author:  Zhenguo Zhang
-	Contact: fortunezzg\@gmail.com
+	Contact: zhangz.sci\@gmail.com
 
-	Last-modified: 2008-10-15
+	Last-modified: 2017-01-17
 
 USAGE
 
 	exit 1;
 }
 
+# a function to read into the exon-intron structure information
 sub _parse_structure_file
 {
-	my $file = shift;
-	
 	my $sep = "\t";
 	my %hash;
-	
-	open(IN,"< $file") or die "can not open $file:$!";
-	while(<IN>)
+	foreach my $file (@_)
 	{
-		next if(/^#/);
-		my @fields = split($sep,$_);
-		next unless(scalar(@fields) > 2);
-		# get the CDS start offset in the sequence
-		my $cdsOffset = 1; # default is the first position of sequence
-		$cdsOffset = $fields[$cdsStartCol] if(defined $cdsStartCol);
-		# mRNA acc as key, the start exon and block strings as value
-		$hash{lc($fields[0])} = [@fields[1,2],$cdsOffset];
+		open(IN,"< $file") or die "can not open $file:$!";
+		while(<IN>)
+		{
+			next if(/^#/);
+			my @fields = split($sep,$_);
+			next unless(scalar(@fields) > 3);
+			# get the CDS start offset in the sequence
+			my $cdsOffset = 1; # default is the first position of sequence
+			$cdsOffset = $fields[$cdsStartCol] if(defined $cdsStartCol);
+			# mRNA acc as key, the exon number of first exon in the
+			# alignment, a string of exon block sizes, and the start
+			# of cds in the included sequence part as value
+			$hash{lc($fields[0])} = [@fields[1,2],$cdsOffset];
+		}
+		close IN;
 	}
-	close IN;
-
 	return \%hash;
 }
 
